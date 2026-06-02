@@ -4,7 +4,7 @@ python -m http.server $PORT &
 
 # 2. Boot up your bot and engine normally
 echo "Starting Look Out Telegram Receptionist..."
-python bot.py &
+python Bot.py &
 
 echo "Starting Look Out Background Engine..."
 python main.py
