@@ -20,9 +20,6 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 MAX_ACTIVE_WATCHES_PER_USER = 1
 
 # --- Database ---
-# Define the local testing path using your bulletproof BASE_DIR logic
-DEFAULT_LOCAL_DB = os.path.join(BASE_DIR, "database", "lookout.db")
+# The connection string to your PostgreSQL database.
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# In the cloud, this pulls the DB_PATH environment variable (the Persistent Volume).
-# If the variable doesn't exist (like on your laptop), it safely defaults to your local path.
-DB_PATH = os.getenv("DB_PATH", DEFAULT_LOCAL_DB)

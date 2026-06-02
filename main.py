@@ -2,7 +2,7 @@
 Look Out - Core Engine Loop (Phase 3 Complete)
 Integrates state management, Groq LLM diff evaluation, and Telegram notifications.
 """
-import sqlite3
+import psycopg2
 import requests
 import config
 import time
@@ -14,11 +14,11 @@ from intelligence.evaluator import evaluate_diff
 
 def get_previous_text(prompt_id: int) -> str:
     """Helper to fetch the actual raw text from the last scrape event."""
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = psycopg2.connect(config.DATABASE_URL)
     cursor = conn.cursor()
     cursor.execute("""
         SELECT sanitized_text FROM scrape_history 
-        WHERE prompt_id = ? 
+        WHERE prompt_id = %s 
         ORDER BY scraped_at DESC LIMIT 1
     """, (prompt_id,))
     row = cursor.fetchone()
@@ -104,9 +104,9 @@ def run_diff_loop():
                 send_telegram_message(telegram_id, message_body)
                 
                 # Auto-Kill Switch
-                conn = sqlite3.connect(config.DB_PATH)
+                conn = psycopg2.connect(config.DATABASE_URL)
                 cursor = conn.cursor()
-                cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = ?", (prompt_id,))
+                cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
                 conn.commit()
                 conn.close()
                 print("  -> Watch auto-paused. Removing from active queue.")
@@ -139,9 +139,9 @@ def run_diff_loop():
             print("  -> Notification pushed to Telegram successfully.")
             
             # --- UPGRADE 2: THE AUTO-KILL SWITCH ---
-            conn = sqlite3.connect(config.DB_PATH)
+            conn = psycopg2.connect(config.DATABASE_URL)
             cursor = conn.cursor()
-            cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = ?", (prompt_id,))
+            cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
             conn.commit()
             conn.close()
             print("  -> Watch auto-paused. Removing from active queue.")

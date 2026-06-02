@@ -1,4 +1,5 @@
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 import os
 import sys
 
@@ -6,38 +7,56 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
-def init_db():
-    """Reads schema.sql and creates the SQLite database tables."""
-    print(f"Initializing database at: {config.DB_PATH}")
-    
-    schema_path = os.path.join(os.path.dirname(__file__), 'schema.sql')
-    
-    with open(schema_path, 'r') as f:
-        schema_script = f.read()
+def get_connection():
+    """Establishes a connection to the PostgreSQL database."""
+    if not config.DATABASE_URL:
+        raise ValueError("DATABASE_URL is not set in config/environment!")
+    return psycopg2.connect(config.DATABASE_URL)
 
-    # Connect to (and create if missing) the SQLite database
-    conn = sqlite3.connect(config.DB_PATH)
+def init_db():
+    """Creates the tables if they don't exist. Uses Postgres syntax."""
+    print("Initializing PostgreSQL database...")
+    conn = get_connection()
     cursor = conn.cursor()
     
-    # Execute the SQL script
-    cursor.executescript(schema_script)
+    # We write the Postgres schema directly here so you can delete schema.sql!
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS prompts (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id),
+            intent TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scrape_history (
+            id SERIAL PRIMARY KEY,
+            prompt_id INTEGER REFERENCES prompts(id) ON DELETE CASCADE,
+            content_hash TEXT NOT NULL,
+            sanitized_text TEXT NOT NULL,
+            scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
     
     conn.commit()
     conn.close()
     print("Database schema loaded successfully.")
 
-if __name__ == "__main__":
-    # If this file is run directly, initialize the database
-    init_db()
-
 
 def get_active_prompts():
     """Fetches all active watches and their associated user's Telegram ID."""
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     
-    # We join the users table so we can get the correct telegram_id for the text message
     cursor.execute("""
         SELECT prompts.id, prompts.target_url, prompts.intent, users.telegram_id 
         FROM prompts 
@@ -46,20 +65,17 @@ def get_active_prompts():
     """)
     rows = cursor.fetchall()
     
-    # Convert rows to a list of dictionaries
-    prompts = [dict(row) for row in rows]
     conn.close()
-    return prompts
+    return [dict(row) for row in rows]
 
 def get_latest_hash(prompt_id: int) -> str:
     """Gets the most recent SHA-256 hash for a specific prompt."""
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
-    # Order by scraped_at DESC to get the newest one
     cursor.execute("""
         SELECT content_hash FROM scrape_history 
-        WHERE prompt_id = ? 
+        WHERE prompt_id = %s 
         ORDER BY scraped_at DESC LIMIT 1
     """, (prompt_id,))
     
@@ -70,26 +86,23 @@ def get_latest_hash(prompt_id: int) -> str:
 
 def save_scrape_history(prompt_id: int, content_hash: str, sanitized_text: str):
     """Saves a new scrape event to the memory bank."""
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     cursor.execute("""
         INSERT INTO scrape_history (prompt_id, content_hash, sanitized_text)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
     """, (prompt_id, content_hash, sanitized_text))
     
     conn.commit()
     conn.close()
 
-def check_user_limit(user_id: int) -> bool:     # GUARDRAIL 1
-    """
-    Checks if a user has reached their maximum allowed active watches.
-    Returns True if they are allowed to add another, False if they are maxed out.
-    """
-    conn = sqlite3.connect(config.DB_PATH)
+def check_user_limit(user_id: int) -> bool:     
+    """Checks if a user has reached their maximum allowed active watches."""
+    conn = get_connection()
     cursor = conn.cursor()
     
-    cursor.execute("SELECT COUNT(*) FROM prompts WHERE user_id = ? AND is_active = 1", (user_id,))
+    cursor.execute("SELECT COUNT(*) FROM prompts WHERE user_id = %s AND is_active = 1", (user_id,))
     active_count = cursor.fetchone()[0]
     
     conn.close()
@@ -98,17 +111,21 @@ def check_user_limit(user_id: int) -> bool:     # GUARDRAIL 1
 
 def get_or_create_user(telegram_id: int) -> int:
     """Ensures the user exists in our database and returns their internal ID."""
-    conn = sqlite3.connect(config.DB_PATH)
-    cursor = conn.cursor()
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     
-    cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
-    result = cursor.fetchone()
+    cursor.execute("SELECT id FROM users WHERE telegram_id = %s", (telegram_id,))
+    user = cursor.fetchone()
     
-    if result:
-        user_id = result[0]
+    if user:
+        user_id = user['id']
     else:
-        cursor.execute("INSERT INTO users (telegram_id) VALUES (?)", (telegram_id,))
-        user_id = cursor.lastrowid
+        # Postgres uses RETURNING id to instantly give back the generated ID
+        cursor.execute(
+            "INSERT INTO users (telegram_id) VALUES (%s) RETURNING id", 
+            (telegram_id,)
+        )
+        user_id = cursor.fetchone()['id']
         
     conn.commit()
     conn.close()
@@ -116,12 +133,12 @@ def get_or_create_user(telegram_id: int) -> int:
 
 def add_new_watch(user_id: int, intent: str, target_url: str):
     """Inserts a new active watch into the database."""
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     cursor.execute("""
         INSERT INTO prompts (user_id, intent, target_url, is_active)
-        VALUES (?, ?, ?, 1)
+        VALUES (%s, %s, %s, 1)
     """, (user_id, intent, target_url))
     
     conn.commit()
@@ -129,23 +146,22 @@ def add_new_watch(user_id: int, intent: str, target_url: str):
 
 def pause_all_user_watches(user_id: int):
     """Sets is_active to 0 for all of a user's watches."""
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
-    cursor.execute("UPDATE prompts SET is_active = 0 WHERE user_id = ?", (user_id,))
+    cursor.execute("UPDATE prompts SET is_active = 0 WHERE user_id = %s", (user_id,))
     
     conn.commit()
     conn.close()
 
 def get_user_prompts(user_id: int):
     """Fetches all prompts (active and paused) for a specific user."""
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
     
     cursor.execute("""
         SELECT id, intent, target_url, is_active 
-        FROM prompts WHERE user_id = ?
+        FROM prompts WHERE user_id = %s ORDER BY id ASC
     """, (user_id,))
     rows = cursor.fetchall()
     conn.close()
@@ -154,12 +170,12 @@ def get_user_prompts(user_id: int):
 
 def resume_prompt(user_id: int, prompt_id: int) -> bool:
     """Sets a specific watch to active. Returns True if successful."""
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
     cursor.execute("""
         UPDATE prompts SET is_active = 1 
-        WHERE id = ? AND user_id = ?
+        WHERE id = %s AND user_id = %s
     """, (prompt_id, user_id))
     
     rows_affected = cursor.rowcount
@@ -170,16 +186,37 @@ def resume_prompt(user_id: int, prompt_id: int) -> bool:
 
 def delete_all_user_watches(user_id: int):
     """Permanently deletes all of a user's watches."""
-    conn = sqlite3.connect(config.DB_PATH)
+    conn = get_connection()
     cursor = conn.cursor()
     
-    # Optional but good practice: clear the history related to these prompts first
     cursor.execute("""
         DELETE FROM scrape_history 
-        WHERE prompt_id IN (SELECT id FROM prompts WHERE user_id = ?)
+        WHERE prompt_id IN (SELECT id FROM prompts WHERE user_id = %s)
     """, (user_id,))
     
-    cursor.execute("DELETE FROM prompts WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM prompts WHERE user_id = %s", (user_id,))
     
     conn.commit()
     conn.close()
+
+# --- MISSING FUNCTION ADDED FOR MAIN.PY ---
+def get_previous_text(prompt_id: int):
+    """Fetches the last sanitized text to send to Groq for diffing."""
+    conn = get_connection()
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    
+    cursor.execute("""
+        SELECT sanitized_text FROM scrape_history 
+        WHERE prompt_id = %s 
+        ORDER BY scraped_at DESC LIMIT 1
+    """, (prompt_id,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return row['sanitized_text']
+    return ""
+
+if __name__ == "__main__":
+    init_db()
