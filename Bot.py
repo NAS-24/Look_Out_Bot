@@ -11,6 +11,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import config
 from intelligence.guard import validate_and_format_intent
+from intelligence.evaluator import extract_watch_parameters
 from database.manager import (
     check_user_limit, get_or_create_user, add_new_watch, pause_all_user_watches,
     get_user_prompts, resume_prompt, delete_all_user_watches
@@ -18,6 +19,14 @@ from database.manager import (
 
 # Define state for the conversation
 WAITING_FOR_URL = 1
+
+def trigger_daemon_wake():
+    """Creates a local flag file to instantly wake the sleeping daemon."""
+    try:
+        open("wake_daemon.flag", "w").close()
+        print("  -> Wake flag created for the background daemon.")
+    except Exception as e:
+        print(f"  -> Failed to create wake flag: {e}")
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Answers the /start command."""
@@ -58,15 +67,27 @@ async def handle_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return WAITING_FOR_URL
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Receives the URL from the user and locks it into the database."""
+    """Receives the URL from the user, infers the schedule, and locks it into the database."""
     target_url = update.message.text
     intent = context.user_data.get('intent')
     telegram_id = update.message.from_user.id
     
     user_id = get_or_create_user(telegram_id)
     
-    # Save to database
-    add_new_watch(user_id, intent, target_url)
+    await update.message.reply_text("Configuring dynamic active windows based on target URL...")
+
+    # Ask Groq to infer the business hours and timezone for this specific target
+    schedule_info = extract_watch_parameters(f"Intent: {intent} URL: {target_url}")
+    
+    tz = schedule_info.get("source_timezone") if schedule_info else None
+    window_start = schedule_info.get("active_window_start") if schedule_info else None
+    window_end = schedule_info.get("active_window_end") if schedule_info else None
+    
+    # Save to database with new timezone parameters
+    add_new_watch(user_id, intent, target_url, window_start, window_end, tz)
+    
+    # WAKE THE DAEMON INSTANTLY
+    trigger_daemon_wake()
     
     await update.message.reply_text(
         f"Link verified. I am now actively monitoring this URL for your intent in the background.\n\n"
@@ -108,7 +129,7 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Resumes a specific watch by ID."""
+    """Resumes a specific watch by ID and wakes the daemon."""
     telegram_id = update.message.from_user.id
     user_id = get_or_create_user(telegram_id)
     
@@ -122,13 +143,15 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ The ID must be a number.")
         return
 
-    # THE GUARDRAIL: We must enforce the 1-watch limit even when resuming!
+    # THE GUARDRAIL: Enforce the watch limit when resuming
     if not check_user_limit(user_id):
         await update.message.reply_text("🛑 You already have an active watch! Please /pause it before resuming another one.")
         return
         
     success = resume_prompt(user_id, prompt_id)
     if success:
+        # WAKE THE DAEMON - A resumed watch needs to be scanned immediately
+        trigger_daemon_wake()
         await update.message.reply_text(f"▶️ Watch #{prompt_id} has been resumed and added to the active queue!")
     else:
         await update.message.reply_text("❌ Could not find a watch with that ID belonging to you.")
@@ -158,7 +181,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🆘 `/help` - Show this manual.\n\n"
         "💡 *System Rules:*\n"
         "• You can only have *one* active watch at a time.\n"
-        "• The system checks your target URL every 60 minutes.\n"
+        "• The system intelligently calculates monitoring intervals based on the target site's active business hours.\n"
         "• If the system finds a match, it will text you and *auto-pause* the watch to free up your queue."
     )
     await update.message.reply_text(help_text, parse_mode='Markdown')

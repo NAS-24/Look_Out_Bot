@@ -17,7 +17,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # --- Product Constraints ---
 # The absolute maximum number of active watches a single user can have at one time.
-MAX_ACTIVE_WATCHES_PER_USER = 1
+MAX_ACTIVE_WATCHES_PER_USER = 2
 
 # --- Database ---
 # The connection string to your PostgreSQL database.

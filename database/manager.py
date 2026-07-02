@@ -19,7 +19,6 @@ def init_db():
     conn = get_connection()
     cursor = conn.cursor()
     
-    # We write the Postgres schema directly here so you can delete schema.sql!
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
@@ -27,6 +26,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
+    # UPDATED: Added active window, timezone, and next_scrape_at columns
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS prompts (
             id SERIAL PRIMARY KEY,
@@ -34,6 +34,10 @@ def init_db():
             intent TEXT NOT NULL,
             target_url TEXT NOT NULL,
             is_active INTEGER DEFAULT 1,
+            active_window_start TIME, 
+            active_window_end TIME,
+            source_timezone TEXT,
+            next_scrape_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -51,22 +55,72 @@ def init_db():
     conn.close()
     print("Database schema loaded successfully.")
 
+# --- NEW MIN-HEAP SCHEDULER FUNCTIONS ---
 
-def get_active_prompts():
-    """Fetches all active watches and their associated user's Telegram ID."""
+def get_next_scrape_deadline():
+    """Fetches the absolute soonest timestamp required for the next scrape."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT MIN(next_scrape_at) 
+        FROM prompts 
+        WHERE is_active = 1
+    """)
+    result = cursor.fetchone()
+    conn.close()
+    
+    return result[0] if result else None
+
+def get_due_prompts():
+    """Fetches ONLY active watches whose scheduled time has passed."""
     conn = get_connection()
     cursor = conn.cursor(cursor_factory=RealDictCursor)
     
     cursor.execute("""
-        SELECT prompts.id, prompts.target_url, prompts.intent, users.telegram_id 
+        SELECT prompts.id, prompts.target_url, prompts.intent, users.telegram_id,
+               prompts.active_window_start, prompts.active_window_end, prompts.source_timezone
         FROM prompts 
         JOIN users ON prompts.user_id = users.id 
-        WHERE prompts.is_active = 1
+        WHERE prompts.is_active = 1 AND prompts.next_scrape_at <= CURRENT_TIMESTAMP
     """)
     rows = cursor.fetchall()
-    
     conn.close()
     return [dict(row) for row in rows]
+
+def update_next_scrape_time(prompt_id: int, next_scrape_at):
+    """Pushes the deadline forward after a scrape is complete."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE prompts SET next_scrape_at = %s 
+        WHERE id = %s
+    """, (next_scrape_at, prompt_id))
+    
+    conn.commit()
+    conn.close()
+
+# --- MODIFIED EXISTING FUNCTIONS ---
+
+# UPDATED: Now accepts active window parameters from Groq's inference
+def add_new_watch(user_id: int, intent: str, target_url: str, 
+                  active_window_start=None, active_window_end=None, 
+                  source_timezone=None):
+    """Inserts a new active watch into the database with initial Day Zero priority."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT INTO prompts (user_id, intent, target_url, is_active, 
+                             active_window_start, active_window_end, source_timezone, next_scrape_at)
+        VALUES (%s, %s, %s, 1, %s, %s, %s, CURRENT_TIMESTAMP)
+    """, (user_id, intent, target_url, active_window_start, active_window_end, source_timezone))
+    
+    conn.commit()
+    conn.close()
+
+# --- UNCHANGED FUNCTIONS BELOW ---
 
 def get_latest_hash(prompt_id: int) -> str:
     """Gets the most recent SHA-256 hash for a specific prompt."""
@@ -120,7 +174,6 @@ def get_or_create_user(telegram_id: int) -> int:
     if user:
         user_id = user['id']
     else:
-        # Postgres uses RETURNING id to instantly give back the generated ID
         cursor.execute(
             "INSERT INTO users (telegram_id) VALUES (%s) RETURNING id", 
             (telegram_id,)
@@ -130,19 +183,6 @@ def get_or_create_user(telegram_id: int) -> int:
     conn.commit()
     conn.close()
     return user_id
-
-def add_new_watch(user_id: int, intent: str, target_url: str):
-    """Inserts a new active watch into the database."""
-    conn = get_connection()
-    cursor = conn.cursor()
-    
-    cursor.execute("""
-        INSERT INTO prompts (user_id, intent, target_url, is_active)
-        VALUES (%s, %s, %s, 1)
-    """, (user_id, intent, target_url))
-    
-    conn.commit()
-    conn.close()
 
 def pause_all_user_watches(user_id: int):
     """Sets is_active to 0 for all of a user's watches."""
@@ -199,7 +239,6 @@ def delete_all_user_watches(user_id: int):
     conn.commit()
     conn.close()
 
-# --- MISSING FUNCTION ADDED FOR MAIN.PY ---
 def get_previous_text(prompt_id: int):
     """Fetches the last sanitized text to send to Groq for diffing."""
     conn = get_connection()
@@ -217,6 +256,3 @@ def get_previous_text(prompt_id: int):
     if row:
         return row['sanitized_text']
     return ""
-
-if __name__ == "__main__":
-    init_db()
