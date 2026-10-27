@@ -39,9 +39,9 @@ def validate_and_format_intent(user_prompt: str) -> dict:
     )
 
     try:
-        # Using llama-3.3-70b-versatile for fast, strict JSON formatting
+        # Using openai/gpt-oss-20b for fast, strict JSON formatting
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
@@ -55,4 +55,6 @@ def validate_and_format_intent(user_prompt: str) -> dict:
 
     except Exception as e:
         print(f"Guardrail Error: {e}")
-        return {"is_valid": False, "reason": "Internal LLM error.", "formatted_intent": "", "suggested_url_search": ""}
+        return {"is_valid": False,
+                "reason": "I'm having a technical problem right now. Please try again in a few minutes.",
+                "formatted_intent": "", "suggested_url_search": ""}

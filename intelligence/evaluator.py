@@ -49,7 +49,7 @@ def extract_watch_parameters(user_message: str) -> dict:
 
     try:
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-20b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"User Request: {user_message}"}
@@ -99,9 +99,9 @@ def evaluate_diff(intent: str, old_text: str, new_text: str) -> dict:
     )
 
     try:
-        # Using llama-3.3-70b-versatile for nuanced structural analysis
+        # Using openai/gpt-oss-120b for nuanced structural analysis
         response = client.chat.completions.create(
-            model="gpt-oss-20b",
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
