@@ -4,6 +4,8 @@ Handles incoming texts, routes them through the LLM Guardrail, and saves them to
 """
 import sys
 import os
+import asyncio
+from utils.url_check import check_url
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
@@ -68,7 +70,11 @@ async def handle_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Receives the URL from the user, infers the schedule, and locks it into the database."""
-    target_url = update.message.text
+    ok, result = await asyncio.to_thread(check_url, update.message.text)
+    if not ok:
+        await update.message.reply_text(f"{result}\n\nSend a different link, or type /start to cancel.")
+        return WAITING_FOR_URL
+    target_url = result
     intent = context.user_data.get('intent')
     telegram_id = update.message.from_user.id
     
@@ -203,13 +209,14 @@ def main():
         fallbacks=[CommandHandler("start", start_command)]
     )
 
+    app.add_handler(conv_handler)
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("pause", pause_command))
     app.add_handler(CommandHandler("list", list_command))    
     app.add_handler(CommandHandler("resume", resume_command)) 
     app.add_handler(CommandHandler("clear", clear_command))  
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conv_handler)
+    
 
     print("--- Look Out Telegram Interface Running ---")
     app.run_polling()
