@@ -41,7 +41,7 @@ def validate_and_format_intent(user_prompt: str) -> dict:
     try:
         # Using openai/gpt-oss-20b for fast, strict JSON formatting
         response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
+            model=config.FAST_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
