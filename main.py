@@ -1,5 +1,5 @@
 """
-Look Out - Core Engine Loop (Phase 4: Min-Heap & Active Windows)
+Look Out - Core Engine Loop (Phase 4.1: Bugfixes & Stability)
 Event-driven scheduler that sleeps securely to preserve DB compute.
 """
 import psycopg2
@@ -73,7 +73,7 @@ def calculate_next_scrape_time(source_timezone, start_time, end_time) -> datetim
         else:
             is_active = current_local_time >= start_time or current_local_time <= end_time
             
-        # 1 hour inside business hours, stretched to 3 hours in the dead zone
+        # FIX (L-19): 1 hour inside business hours, stretched to 3 hours in the dead zone
         interval_hours = 1 if is_active else 3
         
     # Postgres CURRENT_TIMESTAMP on Neon defaults to UTC. We return naive UTC time for the DB.
@@ -141,6 +141,9 @@ def process_prompt(prompt):
             )
             send_telegram_message(telegram_id, message_body)
             
+            # FIX (L-12): Save the new text so if the user resumes this watch, the baseline is accurate
+            save_scrape_history(prompt_id, current_hash, clean_text)
+            
             # Auto-Kill Switch
             conn = psycopg2.connect(config.DATABASE_URL)
             cursor = conn.cursor()
@@ -168,6 +171,9 @@ def process_prompt(prompt):
         )
         send_telegram_message(telegram_id, message_body)
         
+        # FIX (L-12): Save the new text so if the user resumes this watch, the baseline is accurate
+        save_scrape_history(prompt_id, current_hash, clean_text)
+        
         # Auto-Kill Switch
         conn = psycopg2.connect(config.DATABASE_URL)
         cursor = conn.cursor()
@@ -189,9 +195,15 @@ def run_daemon():
             
             # 2. Process all due prompts
             for prompt in due_prompts:
-                process_prompt(prompt)
+                # FIX (L-08): Wrap process_prompt in a try-except block so a crash in one URL 
+                # doesn't break the entire loop and skip the rescheduling step.
+                try:
+                    process_prompt(prompt)
+                except Exception as process_error:
+                    print(f"  -> Critical Error processing prompt {prompt['id']}: {process_error}")
+                    # We catch it here, print it, and ALLOW the code to continue to step 3!
                 
-                # 3. Calculate dynamic next interval and update database
+                # 3. Calculate dynamic next interval and update database (GUARANTEED TO RUN NOW)
                 next_time = calculate_next_scrape_time(
                     prompt['source_timezone'], 
                     prompt['active_window_start'], 
