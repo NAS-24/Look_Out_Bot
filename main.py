@@ -15,12 +15,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 from database.manager import (
     get_due_prompts, get_next_scrape_deadline, update_next_scrape_time, 
-    get_latest_hash, save_scrape_history
+    get_latest_hash, save_scrape_history, increment_failure, reset_failure 
 )
 from scraper.engine import fetch_html
 from scraper.cleaner import sanitize_html
 from utils.hasher import generate_hash
-from intelligence.evaluator import evaluate_diff
+from intelligence.evaluator import evaluate_diff, evaluate_first_scan
 
 FLAG_FILE = "wake_daemon.flag"
 
@@ -37,14 +37,17 @@ def get_previous_text(prompt_id: int) -> str:
     conn.close()
     return row[0] if row else ""
 
-def send_telegram_message(chat_id: int, text: str):
-    """Pushes the LLM summary directly to the user's phone."""
+def send_telegram_message(chat_id: int, text: str) -> bool:
+    """Pushes the LLM summary directly to the user's phone. Returns True if successful."""
     url = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id, "text": text}
     try:
-        requests.post(url, json=payload)
+        response = requests.post(url, json=payload)
+        response.raise_for_status() # This explicitly checks if Telegram replied with a success code
+        return True
     except Exception as e:
         print(f"  -> ERROR: Failed to send Telegram message: {e}")
+        return False
 
 def calculate_next_scrape_time(source_timezone, start_time, end_time) -> datetime.datetime:
     """Calculates dynamic intervals based on active business hours."""
@@ -115,7 +118,29 @@ def process_prompt(prompt):
     
     if not clean_text:
         print("  -> ERROR: Failed to extract text.")
-        return # Reschedule anyway to avoid endless immediate loops
+        
+        # CIRCUIT BREAKER LOGIC
+        fail_count = increment_failure(prompt_id)
+        print(f"  -> Consecutive failures for Watch {prompt_id}: {fail_count}/3")
+        
+        if fail_count >= 3:
+            print("  -> [!!!] CIRCUIT BREAKER TRIPPED. Pausing watch.")
+            msg = (f"⚠️ *Look Out Alert*\n\nI couldn't read your target page the last 3 times I checked it. "
+                   f"The site might be blocking me or permanently offline.\n\n"
+                   f"🔗 {target_url}\n\n⏸️ *I have paused this watch.* Use `/resume {prompt_id}` if you want me to try again later.")
+            send_telegram_message(telegram_id, msg)
+            
+            # Auto-pause it in DB
+            conn = psycopg2.connect(config.DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
+            conn.commit()
+            conn.close()
+            
+        return # Reschedule anyway so it moves down the queue
+        
+    
+    reset_failure(prompt_id)
         
     current_hash = generate_hash(clean_text)
     last_hash = get_latest_hash(prompt_id)
@@ -128,8 +153,11 @@ def process_prompt(prompt):
     # 2. THE DAY ZERO SCAN (First Run)
     if last_hash is None:
         print("  -> Result: FIRST RUN. Checking if target information is already present...")
-        dummy_old = "This is the very first scan. There is no old text. Just tell me if the NEW text already fulfills the user's intent."
-        evaluation = evaluate_diff(intent, dummy_old, clean_text)
+        evaluation = evaluate_first_scan(intent, clean_text)
+        
+        if evaluation.get("error"):
+            print("  -> LLM Error on first scan. Skipping baseline save to retry later.")
+            return
         
         if evaluation.get("is_meaningful"):
             print("  -> [!!!] TARGET ALREADY MET ON FIRST SCAN [!!!]")
@@ -139,17 +167,23 @@ def process_prompt(prompt):
                 f"🚨 *Look Out Update (Found on Initial Scan!)*\n\n🔗 {target_url}\n\n"
                 f"📝 {summary}\n\n⏸️ *This watch has been auto-paused.*"
             )
-            send_telegram_message(telegram_id, message_body)
-            
+            # send_telegram_message(telegram_id, message_body)
+
+            msg_sent = send_telegram_message(telegram_id, message_body)
             # FIX (L-12): Save the new text so if the user resumes this watch, the baseline is accurate
             save_scrape_history(prompt_id, current_hash, clean_text)
             
-            # Auto-Kill Switch
-            conn = psycopg2.connect(config.DATABASE_URL)
-            cursor = conn.cursor()
-            cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
-            conn.commit()
-            conn.close()
+            if msg_sent:
+                    # Telegram successfully delivered it. Safe to run the Auto-Kill Switch.
+                    conn = psycopg2.connect(config.DATABASE_URL)
+                    cursor = conn.cursor()
+                    cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
+                    conn.commit()
+                    conn.close()
+            else:
+                    # Telegram failed! Don't pause it, let the bot try again next cycle.
+                    print("  -> Telegram delivery failed! Keeping watch active to retry next cycle.")
+                    
             return
         else:
             print("  -> Target info not present yet. Establishing baseline memory cache.")
@@ -161,6 +195,10 @@ def process_prompt(prompt):
     old_text = get_previous_text(prompt_id)
     evaluation = evaluate_diff(intent, old_text, clean_text)
     
+    if evaluation.get("error"):
+        print("  -> LLM Error. Keeping old baseline and retrying later.")
+        return
+    
     if evaluation.get("is_meaningful"):
         print("  -> [!!!] MEANINGFUL CHANGE CONFIRMED BY LLM [!!!]")
         summary = evaluation.get('summary')
@@ -169,17 +207,23 @@ def process_prompt(prompt):
             f"🚨 *Look Out Update*\n\n🔗 {target_url}\n\n📝 {summary}\n\n"
             f"⏸️ *This watch has been auto-paused.*"
         )
-        send_telegram_message(telegram_id, message_body)
+        msg_sent=send_telegram_message(telegram_id, message_body)
         
         # FIX (L-12): Save the new text so if the user resumes this watch, the baseline is accurate
         save_scrape_history(prompt_id, current_hash, clean_text)
         
-        # Auto-Kill Switch
-        conn = psycopg2.connect(config.DATABASE_URL)
-        cursor = conn.cursor()
-        cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
-        conn.commit()
-        conn.close()
+        if msg_sent:
+                # Telegram successfully delivered it. Safe to run the Auto-Kill Switch.
+                conn = psycopg2.connect(config.DATABASE_URL)
+                cursor = conn.cursor()
+                cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
+                conn.commit()
+                conn.close()
+        else:
+                # Telegram failed! Don't pause it, let the bot try again next cycle.
+                print("  -> Telegram delivery failed! Keeping watch active to retry next cycle.")
+                
+        return
     else:
         print("  -> Result: Change categorized as superficial noise by LLM. Staying silent.")
         save_scrape_history(prompt_id, current_hash, clean_text)

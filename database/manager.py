@@ -26,7 +26,7 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-    # UPDATED: Added active window, timezone, and next_scrape_at columns
+    # Added consecutive_failures for the Circuit Breaker
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS prompts (
             id SERIAL PRIMARY KEY,
@@ -38,6 +38,7 @@ def init_db():
             active_window_end TIME,
             source_timezone TEXT,
             next_scrape_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            consecutive_failures INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
@@ -101,9 +102,8 @@ def update_next_scrape_time(prompt_id: int, next_scrape_at):
     conn.commit()
     conn.close()
 
-# --- MODIFIED EXISTING FUNCTIONS ---
 
-# UPDATED: Now accepts active window parameters from Groq's inference
+
 def add_new_watch(user_id: int, intent: str, target_url: str, 
                   active_window_start=None, active_window_end=None, 
                   source_timezone=None):
@@ -113,14 +113,42 @@ def add_new_watch(user_id: int, intent: str, target_url: str,
     
     cursor.execute("""
         INSERT INTO prompts (user_id, intent, target_url, is_active, 
-                             active_window_start, active_window_end, source_timezone, next_scrape_at)
-        VALUES (%s, %s, %s, 1, %s, %s, %s, CURRENT_TIMESTAMP)
+                             active_window_start, active_window_end, source_timezone, next_scrape_at, consecutive_failures)
+        VALUES (%s, %s, %s, 1, %s, %s, %s, CURRENT_TIMESTAMP, 0)
     """, (user_id, intent, target_url, active_window_start, active_window_end, source_timezone))
     
     conn.commit()
     conn.close()
 
-# --- UNCHANGED FUNCTIONS BELOW ---
+# --- CIRCUIT BREAKER FUNCTIONS (L-07 & L-14) ---
+
+def increment_failure(prompt_id: int) -> int:
+    """Increments the failure count atomically and returns the new count."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE prompts 
+        SET consecutive_failures = consecutive_failures + 1 
+        WHERE id = %s 
+        RETURNING consecutive_failures
+    """, (prompt_id,))
+    
+    new_count = cursor.fetchone()[0]
+    conn.commit()
+    conn.close()
+    return new_count
+
+def reset_failure(prompt_id: int):
+    """Resets the failure counter to 0 on a successful scrape."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("UPDATE prompts SET consecutive_failures = 0 WHERE id = %s", (prompt_id,))
+    
+    conn.commit()
+    conn.close()
+
 
 def get_latest_hash(prompt_id: int) -> str:
     """Gets the most recent SHA-256 hash for a specific prompt."""

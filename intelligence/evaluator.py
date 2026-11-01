@@ -1,3 +1,7 @@
+"""
+Look Out - Diff Intelligence Layer
+Uses Groq API to evaluate if physical text diffs have semantic meaning.
+"""
 import os
 import json
 from groq import Groq
@@ -18,7 +22,7 @@ def get_groq_client():
 def extract_watch_parameters(user_message: str) -> dict:
     """
     Parses the initial Telegram request to extract the target URL, monitoring intent, 
-    and logically infers the source's timezone and active window for the min-heap scheduler.
+    and logically infers the source's timezone and active window.
     """
     try:
         client = get_groq_client()
@@ -49,12 +53,12 @@ def extract_watch_parameters(user_message: str) -> dict:
 
     try:
         response = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
+            model=config.FAST_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"User Request: {user_message}"}
             ],
-            temperature=0.1,  # Low temp for reliable JSON adherence and logical constraints
+            temperature=0.1,
             response_format={"type": "json_object"}
         )
         return json.loads(response.choices[0].message.content)
@@ -64,7 +68,54 @@ def extract_watch_parameters(user_message: str) -> dict:
         return None
 
 
-# --- EXISTING: DIFF INTELLIGENCE (Untouched Logic) ---
+# --- FIRST SCAN INTELLIGENCE (Fixes L-09) ---
+
+def evaluate_first_scan(intent: str, new_text: str) -> dict:
+    """
+    Evaluates 'Day Zero' scans. Differentiates between 'state' intents (which can be met immediately)
+    and 'change' intents (which require a baseline and cannot be met on the first scan).
+    """
+    try:
+        client = get_groq_client()
+    except ValueError as e:
+        print(e)
+        return {"is_meaningful": False, "summary": "", "error": True}
+
+    system_prompt = (
+        "You are evaluating the FIRST SCAN of a webpage for a monitoring bot.\n"
+        "You must determine if the user's intent is ALREADY MET by the current state of the page.\n\n"
+        "CRITICAL RULES:\n"
+        "1. 'CHANGE' INTENTS: If the user wants to know when something *changes* (e.g., 'tell me when the price drops', 'watch for new listings'), you CANNOT fulfill this because you have no past baseline. You MUST return is_meaningful: false.\n"
+        "2. 'STATE' INTENTS: If the user wants to know if a specific state exists (e.g., 'is registration open?', 'is the item in stock?'), and the page currently shows it IS open or in stock, return is_meaningful: true.\n"
+        "3. PRICE RULES: Seeing a crossed-out MRP (Maximum Retail Price) next to a lower selling price is NOT a price drop. It is a standard display. Do not alert on this.\n\n"
+        "You MUST respond with a valid JSON object matching this schema exactly:\n"
+        "{\n"
+        '  "is_meaningful": true or false,\n'
+        '  "summary": "Explanation if met, else empty.",\n'
+        '  "error": false\n'
+        "}\n"
+    )
+
+    user_content = f"Intent: {intent}\n\n--- PAGE TEXT ---\n{new_text[:6000]}\n"
+
+    try:
+        response = client.chat.completions.create(
+            model=config.SLOW_MODEL,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content}
+            ],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        return json.loads(response.choices[0].message.content)
+
+    except Exception as e:
+        print(f"First Scan Intelligence Error: {e}")
+        return {"is_meaningful": False, "summary": "", "error": True}
+
+
+# --- EXISTING: DIFF INTELLIGENCE (Fixes L-10, L-11) ---
 
 def evaluate_diff(intent: str, old_text: str, new_text: str) -> dict:
     """
@@ -75,21 +126,28 @@ def evaluate_diff(intent: str, old_text: str, new_text: str) -> dict:
         client = get_groq_client()
     except ValueError as e:
         print(e)
-        return {"is_meaningful": False, "summary": ""}
+        # Fix L-10: Explicitly return an error flag so we don't save a bad baseline
+        return {"is_meaningful": False, "summary": "", "error": True}
 
-    # System instruction enforces strict JSON output and rules out background noise
+    # Fix L-11: Explicit, strict rules to eliminate noise and false positives
     system_prompt = (
-        "You are the core diff intelligence engine for Look Out, a background daemon.\n"
-        "Your task is to compare an older scrape of a webpage against a newer scrape and determine "
-        "if any changes are structurally meaningful relative to the user's monitoring request (intent).\n\n"
-        "Ignore superficial noise such as shifting visitor counts, timestamps, relative times (e.g., '3 minutes ago'), "
-        "upvote numbers, or ad text.\n\n"
+        "You are the core diff intelligence engine for Look Out.\n"
+        "Your task is to compare OLD and NEW webpage scrapes and determine if a structurally meaningful change occurred that fulfills the user's intent.\n\n"
+        "CRITICAL RULES:\n"
+        "1. Judge ONLY against the user's explicit intent.\n"
+        "2. IGNORE noise: visitor counts, timestamps, relative times, upvotes, ratings, or ad text.\n"
+        "3. PRICE INTENTS: Compare the final selling price only. Do not confuse crossed-out MRPs or discount percentages with a price drop.\n"
+        "4. AVAILABILITY: 'Notify me', 'Coming soon', or 'Out of stock' changing to 'Buy now', 'Add to cart', or 'Available' is meaningful.\n"
+        "5. NEW LISTINGS: An item present in NEW but missing in OLD is meaningful if it matches the intent.\n"
+        "6. STATUS: 'Closed' changing to 'Open' or 'Apply now' is meaningful.\n"
+        "7. ERRORS: 404, 503, 'Access Denied', or CAPTCHA pages are NEVER meaningful.\n"
+        "8. If unsure, default to not meaningful.\n\n"
         "You MUST respond with a valid JSON object matching this schema exactly:\n"
         "{\n"
         '  "is_meaningful": true or false,\n'
-        '  "summary": "A friendly, plain-language message summarizing exactly what changed and why it matters to the user, or an empty string if not meaningful."\n'
+        '  "summary": "Plain-language summary of what changed and why it matters, or empty string.",\n'
+        '  "error": false\n'
         "}\n"
-        "Do not include any chat formatting, conversational filler, markdown boxes, or text outside the JSON block."
     )
 
     user_content = (
@@ -99,20 +157,18 @@ def evaluate_diff(intent: str, old_text: str, new_text: str) -> dict:
     )
 
     try:
-        # Using openai/gpt-oss-120b for nuanced structural analysis
         response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
+            model=config.SLOW_MODEL,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content}
             ],
-            temperature=0.1,  # Low temperature guarantees deterministic evaluation
+            temperature=0.1,
             response_format={"type": "json_object"}
         )
-        
-        result_content = response.choices[0].message.content
-        return json.loads(result_content)
+        return json.loads(response.choices[0].message.content)
 
     except Exception as e:
         print(f"Intelligence Layer Error: {e}")
-        return {"is_meaningful": False, "summary": ""}
+        # Fix L-10: Safely flag the error
+        return {"is_meaningful": False, "summary": "", "error": True}

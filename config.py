@@ -23,3 +23,5 @@ MAX_ACTIVE_WATCHES_PER_USER = 2
 # The connection string to your PostgreSQL database.
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+FAST_MODEL = "openai/gpt-oss-20b"   # Used for Source Discovery
+SLOW_MODEL = "openai/gpt-oss-120b"  # Used for deep Diff Evaluation
