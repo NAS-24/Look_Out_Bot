@@ -4,6 +4,7 @@ Handles incoming texts, routes them through the LLM Guardrail, and saves them to
 """
 import sys
 import os
+import re
 import asyncio
 from utils.url_check import check_url
 from telegram import Update
@@ -58,8 +59,44 @@ async def handle_intent(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Request rejected: {eval_result.get('reason')}")
         return ConversationHandler.END
 
-    # 3. Store the clean intent in memory and ask for URL (Human-in-the-Loop)
     clean_intent = eval_result.get("formatted_intent")
+    
+    # --- NEW: SMART FAST-TRACK LOGIC ---
+    # Check if the user already included a URL in their initial message
+    url_match = re.search(r'(https?://[^\s]+)', raw_text)
+    
+    if url_match:
+        extracted_url = url_match.group(1)
+        await update.message.reply_text(f"Intent approved: '{clean_intent}'\nURL detected! Fast-tracking setup...")
+        
+        # Validate the extracted URL immediately
+        ok, result = await asyncio.to_thread(check_url, extracted_url)
+        if not ok:
+            await update.message.reply_text(f"{result}\n\nPlease reply with a valid URL to continue.")
+            context.user_data['intent'] = clean_intent
+            return WAITING_FOR_URL
+            
+        target_url = result
+        await update.message.reply_text("Configuring dynamic active windows based on target URL...")
+        
+        # Infer schedule and save to database
+        schedule_info = extract_watch_parameters(f"Intent: {clean_intent} URL: {target_url}")
+        
+        tz = schedule_info.get("source_timezone") if schedule_info else None
+        window_start = schedule_info.get("active_window_start") if schedule_info else None
+        window_end = schedule_info.get("active_window_end") if schedule_info else None
+        
+        add_new_watch(user_id, clean_intent, target_url, window_start, window_end, tz)
+        trigger_daemon_wake()
+        
+        await update.message.reply_text(
+            f"Link verified. I am now actively monitoring this URL for your intent in the background.\n\n"
+            f"You can close this chat. I will text you only when something meaningful happens."
+        )
+        return ConversationHandler.END
+
+    # --- ORIGINAL V1 FLOW ---
+    # 3. Store the clean intent in memory and ask for URL (Human-in-the-Loop)
     context.user_data['intent'] = clean_intent
     
     await update.message.reply_text(
