@@ -141,7 +141,8 @@ def evaluate_diff(intent: str, old_text: str, new_text: str) -> dict:
         "5. NEW LISTINGS: An item present in NEW but missing in OLD is meaningful if it matches the intent.\n"
         "6. STATUS: 'Closed' changing to 'Open' or 'Apply now' is meaningful.\n"
         "7. ERRORS: 404, 503, 'Access Denied', or CAPTCHA pages are NEVER meaningful.\n"
-        "8. If unsure, default to not meaningful.\n\n"
+        "8. INCOMPLETE BASELINES: If the OLD text clearly lacks core page information, products, or prices (indicating a broken previous scrape), you CANNOT evaluate a change. Return is_meaningful: false.\n"
+        "9. If unsure, default to not meaningful.\n\n"
         "You MUST respond with a valid JSON object matching this schema exactly:\n"
         "{\n"
         '  "is_meaningful": true or false,\n'

@@ -42,8 +42,20 @@ def fetch_html(url: str, max_retries: int = 2) -> str:
                 # Force a hard 3-second wait to let React/Next.js paint the text on the screen
                 page.wait_for_timeout(3000)
                 raw_html = page.content()
+                raw_lower = raw_html.lower()
                 
-                break # Success! Break out of the retry loop.
+                # HTTP 200 Interstitial & Phrase Check
+                if len(raw_html) < 500 or "click the button below to continue shopping" in raw_lower or "not a robot" in raw_lower:
+                    print(f"  -> Scraper Warning: Interstitial or bot-check detected (Attempt {attempt + 1})")
+                    if attempt < max_retries:
+                        time.sleep(3)
+                        continue
+                    else:
+                        print("  -> Scraper Error: Max retries reached on interstitial.")
+                        raw_html = "" # Return empty so main.py handles it as a failure
+                        break
+                
+                break 
                 
             except Exception as e:
                 print(f"  -> Engine Exception: Failed to fetch {url}. Reason: {e} (Attempt {attempt + 1})")

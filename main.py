@@ -193,6 +193,29 @@ def process_prompt(prompt):
     # 3. THE STANDARD DIFF SCAN
     print("  -> Physical change detected. Fetching previous data for LLM evaluation...")
     old_text = get_previous_text(prompt_id)
+
+    # The Relative Length Guard
+    if old_text and len(clean_text) < (0.2 * len(old_text)):
+        print(f"  -> [!] MASSIVE DROP-OFF: New text is {len(clean_text)} chars, old was {len(old_text)}. Treating as blocked interstitial.")
+        
+        fail_count = increment_failure(prompt_id)
+        print(f"  -> Consecutive failures for Watch {prompt_id}: {fail_count}/3")
+        
+        if fail_count >= 3:
+            print("  -> [!!!] CIRCUIT BREAKER TRIPPED. Pausing watch.")
+            msg = (f"⚠️ *Look Out Alert*\n\nI couldn't read your target page the last 3 times I checked it. "
+                   f"The site might be blocking me or permanently offline.\n\n"
+                   f"🔗 {target_url}\n\n⏸️ *I have paused this watch.* Use `/resume {prompt_id}` if you want me to try again later.")
+            send_telegram_message(telegram_id, msg)
+            
+            conn = psycopg2.connect(config.DATABASE_URL)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE prompts SET is_active = 0 WHERE id = %s", (prompt_id,))
+            conn.commit()
+            conn.close()
+            
+        return 
+    
     evaluation = evaluate_diff(intent, old_text, clean_text)
     
     if evaluation.get("error"):
